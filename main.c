@@ -34,6 +34,46 @@
 #define HASH_MULTIPLIER 19
 #endif
 
+#ifdef MULTITHREADING
+
+int ct_grow(cuckoo_trie* trie);
+
+// Enter a public operation on <trie>. Blocks if a resize is in progress.
+static inline void ct_enter_op(cuckoo_trie* trie)
+{
+	while (1) {
+		// Try to join as an active op
+		uint64_t old = __atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+
+		// If not resizing, we’re good
+		if (__atomic_load_n(&(trie->resizing), __ATOMIC_ACQUIRE) == 0) {
+			(void)old;
+			return;
+		}
+
+		// A resize started between our increment and the check.
+		// Back out and wait for the resize to finish.
+		__atomic_fetch_sub(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+
+		while (__atomic_load_n(&(trie->resizing), __ATOMIC_ACQUIRE) != 0) {
+			// simple spin; you can add a pause/yield here for politeness
+		}
+	}
+}
+
+static inline void ct_exit_op(cuckoo_trie* trie)
+{
+	__atomic_fetch_sub(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+}
+
+#else
+
+// Single-threaded build: no-op
+static inline void ct_enter_op(cuckoo_trie* trie) { (void)trie; }
+static inline void ct_exit_op(cuckoo_trie* trie) { (void)trie; }
+
+#endif
+
 uint64_t ptr_to_bucket(cuckoo_trie* trie, ct_entry_storage* entry) {
 	return ((uintptr_t)entry - (uintptr_t)(trie->buckets)) / sizeof(ct_bucket);
 }
@@ -1838,6 +1878,18 @@ int ct_insert_internal(cuckoo_trie* trie, ct_kv* kv, int is_upsert) {
 
 	result = create_leaf(&finger, kv, symbol);
 
+	// If the trie is full, attempt to grow it and ask caller to retry.
+	if (result == SI_FAIL) {
+#if defined(MULTITHREADING) && CT_ENABLE_GROWING
+		if (ct_grow(trie)) {
+			// Tell the caller to retry the insert on the grown trie
+			return SI_RETRY;
+		}
+#endif
+		// Either no growing support or grow failed: propagate overflow
+		return SI_FAIL;
+	}
+
 	if (is_upsert && result == SI_EXISTS) {
 		assert(entry_type(&(finger.containing_entry.value)) == TYPE_LEAF);
 		ret = upgrade_lock(&(finger.lock_mgr), &(finger.containing_entry));
@@ -1853,11 +1905,15 @@ int ct_insert_internal(cuckoo_trie* trie, ct_kv* kv, int is_upsert) {
 	return result;
 }
 
+
 int ct_insert(cuckoo_trie* trie, ct_kv* kv) {
 	int ret;
+	int status;
 
 	if (kv_key_size(kv) > MAX_KEY_BYTES)
 		return S_KEYTOOLONG;
+
+	ct_enter_op(trie);
 
 	do {
 		ret = ct_insert_internal(trie, kv, 0);
@@ -1866,20 +1922,27 @@ int ct_insert(cuckoo_trie* trie, ct_kv* kv) {
 	} while (ret == SI_RETRY);
 
 	if (ret == SI_FAIL)
-		return S_OVERFLOW;
+		status = S_OVERFLOW;
+	else if (ret == SI_EXISTS)
+		status = S_ALREADYIN;
+	else {
+		assert(ret == SI_OK);
+		status = S_OK;
+	}
 
-	if (ret == SI_EXISTS)
-		return S_ALREADYIN;
-
-	assert(ret == SI_OK);
-	return S_OK;
+	ct_exit_op(trie);
+	return status;
 }
+
 
 int ct_upsert(cuckoo_trie* trie, ct_kv* kv, int* created_new) {
 	int ret;
+	int status;
 
 	if (kv_key_size(kv) > MAX_KEY_BYTES)
 		return S_KEYTOOLONG;
+
+	ct_enter_op(trie);
 
 	do {
 		ret = ct_insert_internal(trie, kv, 1);
@@ -1887,28 +1950,32 @@ int ct_upsert(cuckoo_trie* trie, ct_kv* kv, int* created_new) {
 			debug_log("Insert retry\n");
 	} while (ret == SI_RETRY);
 
-	if (ret == SI_FAIL)
-		return S_OVERFLOW;
+	if (ret == SI_FAIL) {
+		status = S_OVERFLOW;
+	} else {
+		assert(ret == SI_OK || ret == SI_EXISTS);
+		*created_new = (ret == SI_OK);
+		status = S_OK;
+	}
 
-	assert(ret == SI_OK || ret == SI_EXISTS);
-
-	if (ret == SI_EXISTS)
-		*created_new = 0;
-	else
-		*created_new = 1;
-
-	return S_OK;
+	ct_exit_op(trie);
+	return status;
 }
 
 ct_kv* ct_lookup(cuckoo_trie* trie, uint64_t key_size, uint8_t* key_bytes) {
 	int symbol;
 	ct_finger finger;
 	ct_entry_storage* root;
+	ct_kv* result = NULL;
+
+	ct_enter_op(trie);
 
 	root = init_finger(&finger, trie);
 
-	if (root == NULL)
-		return NULL;  // The trie is empty
+	if (root == NULL) {
+		// The trie is empty
+		goto out;
+	}
 
 	symbol = descend(&finger, key_size, key_bytes, 0);
 
@@ -1916,18 +1983,25 @@ ct_kv* ct_lookup(cuckoo_trie* trie, uint64_t key_size, uint8_t* key_bytes) {
 	// must point to the key itself
 	if (symbol == -1) {
 		assert(entry_type(&(finger.containing_entry.value)) == TYPE_LEAF);
-		return entry_kv(&(finger.containing_entry.value));
+		result = entry_kv(&(finger.containing_entry.value));
+		goto out;
 	}
 
-	if (entry_type(&(finger.containing_entry.value)) != TYPE_LEAF)
-		return NULL; // No uniq-prefix matches <key>
+	if (entry_type(&(finger.containing_entry.value)) != TYPE_LEAF) {
+		// No uniq-prefix matches <key>
+		goto out;
+	}
 
 	// Compare with the key stored in the leaf
-	ct_kv* leaf_kv = entry_kv(&(finger.containing_entry.value));
-	if (kv_key_compare_to(leaf_kv, key_size, key_bytes) == 0)
-		return leaf_kv;
+	{
+		ct_kv* leaf_kv = entry_kv(&(finger.containing_entry.value));
+		if (kv_key_compare_to(leaf_kv, key_size, key_bytes) == 0)
+			result = leaf_kv;
+	}
 
-	return NULL;
+out:
+	ct_exit_op(trie);
+	return result;
 }
 
 int ct_update_internal(cuckoo_trie* trie, ct_kv* kv) {
@@ -1966,6 +2040,9 @@ int ct_update_internal(cuckoo_trie* trie, ct_kv* kv) {
 
 int ct_update(cuckoo_trie* trie, ct_kv* kv) {
 	int ret;
+	int status;
+
+	ct_enter_op(trie);
 
 	while (1) {
 		ret = ct_update_internal(trie, kv);
@@ -1974,10 +2051,14 @@ int ct_update(cuckoo_trie* trie, ct_kv* kv) {
 	}
 
 	if (ret == SI_FAIL)
-		return S_NOTFOUND;
+		status = S_NOTFOUND;
+	else {
+		assert(ret == SI_OK);
+		status = S_OK;
+	}
 
-	assert(ret == SI_OK);
-	return S_OK;
+	ct_exit_op(trie);
+	return status;
 }
 
 // Place the iterator on the first key larger or equal to <key>
@@ -2106,7 +2187,9 @@ int ct_iter_next_internal(ct_iter* iter) {
 void ct_iter_goto(ct_iter* iter, uint64_t key_size, uint8_t* key_bytes) {
 	int result;
 
-	while(1) {
+	ct_enter_op(iter->trie);
+
+	while (1) {
 		result = ct_iter_goto_internal(iter, key_size, key_bytes);
 #ifndef MULTITHREADING
 		assert(result == SI_OK);
@@ -2119,17 +2202,7 @@ void ct_iter_goto(ct_iter* iter, uint64_t key_size, uint8_t* key_bytes) {
 			iter->is_exhausted = 1;
 
 		if (iter->is_exhausted)
-			return;
-
-		// A fine point: The iterator now contains a leaf A with A.key < <key>,
-		// A.next = C and C.key >= <key>. Assume now that a leaf B is added to the
-		// trie between A and C before the first call to ct_iter_next. ct_iter_next
-		// will detect that when it re-reads A and will resync the iterator. The
-		// iterator will then fetch B, but cannot compare <key> and B.key to know
-		// whether to report it.
-		// Instead of storing a copy of <key> in the iterator, we advance it
-		// here, while we have a pointer to <key>, and report the fetched key
-		// on the next call to ct_iter_next.
+			goto out;
 
 		result = ct_iter_next_internal(iter);
 #ifndef MULTITHREADING
@@ -2142,51 +2215,47 @@ void ct_iter_goto(ct_iter* iter, uint64_t key_size, uint8_t* key_bytes) {
 	}
 
 	iter->report_current = 1;
+
+out:
+	ct_exit_op(iter->trie);
 }
 
 // Retrieve the next key from the iterator and advance it
 // Returns NULL if the maximal key was already returned
 ct_kv* ct_iter_next(ct_iter* iter) {
 	int result;
+	ct_kv* kv = NULL;
 
-	if (iter->is_exhausted)
-		return NULL;
+	ct_enter_op(iter->trie);
+
+	if (iter->is_exhausted) {
+		goto out;
+	}
 
 	if (iter->report_current) {
 		iter->report_current = 0;
-		return entry_kv(&(iter_max_leaf(iter)->value));
+		kv = entry_kv(&(iter_max_leaf(iter)->value));
+		goto out;
 	}
 
 	if (iter->leaves[0].value.next_leaf.primary_bucket == ((uint32_t)-1)) {
 		iter->is_exhausted = 1;
-		return NULL;
+		goto out;
 	}
 
 	while (1) {
 		result = ct_iter_next_internal(iter);
 
 		if (result == SI_RETRY) {
+#ifdef MULTITHREADING
 			// The linked list was changed. Recompute iter->leaves to point to consecutive
 			// leaves.
-#ifdef MULTITHREADING
-			// The next key to report isn't the minimal key.
-
-			// Goto the last reported key, and go to the first key after it.
-			// We always advance an iterator once in ct_iter_goto, so
-			// iter_max_leaf(iter) is a leaf in the trie, and not one of
-			// the pseudo-leaves in trie->min_leaf
 			ct_kv* last_reported_key = entry_kv(&(iter_max_leaf(iter)->value));
 			ct_iter_goto(iter, kv_key_size(last_reported_key), kv_key_bytes(last_reported_key));
-
-			// ct_iter_goto will set report_current, as the last reported
-			// key is still in the trie. However, it was already reported (ct_iter_goto
-			// doesn't know that). Unset report_current.
 			assert(iter->report_current);
 			iter->report_current = 0;
-
 			continue;
 #else
-			// Without multithreading, we don't expect concurrent modifications.
 			assert(0);
 #endif
 		}
@@ -2195,8 +2264,11 @@ ct_kv* ct_iter_next(ct_iter* iter) {
 		break;
 	}
 
-	// Return the kv of the newly fetched leaf
-	return entry_kv(&(iter_max_leaf(iter)->value));
+	kv = entry_kv(&(iter_max_leaf(iter)->value));
+
+out:
+	ct_exit_op(iter->trie);
+	return kv;
 }
 
 ct_iter* ct_iter_alloc(cuckoo_trie* trie) {
@@ -2229,6 +2301,131 @@ void init_bucket_mix_table(cuckoo_trie* trie) {
 	for (i = 0; i < (1 << TAG_BITS); i++)
 		trie->bucket_mix_table[i] = rand_uint64() % trie->num_buckets;
 }
+
+// Reinsert all existing keys from old_trie into new_trie.
+// Assumes NO concurrent operations on old_trie (resizer has exclusive access).
+int migrate_all_keys(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
+{
+	ct_entry_local_copy cur;
+
+	// Read the pseudo-leaf head in min_leaf_bucket
+	read_min_leaf(old_trie, &cur);
+	ct_entry_locator loc = cur.value.next_leaf;
+
+	while (loc.primary_bucket != (uint32_t)-1) {
+		// Locate the real leaf in the old trie
+		locator_to_entry(old_trie, &loc, &cur);
+		assert(entry_type(&(cur.value)) == TYPE_LEAF);
+
+		ct_kv* kv = entry_kv(&(cur.value));
+		int ret;
+
+		// Insert into new_trie using internal insert (no public wrappers here)
+		do {
+			ret = ct_insert_internal(new_trie, kv, 0 /* is_upsert */);
+		} while (ret == SI_RETRY);
+
+		if (ret != SI_OK && ret != SI_EXISTS) {
+			// SI_EXISTS should not really happen for a clean migration; treat any
+			// other failure as fatal.
+			return SI_FAIL;
+		}
+
+		// Advance along the leaf linked list
+		loc = cur.value.next_leaf;
+	}
+
+	return SI_OK;
+}
+
+// Grow the trie by allocating a larger backing table and migrating all keys.
+// Returns 1 on success (or if another thread already grew it), 0 on failure.
+int ct_grow(cuckoo_trie* trie)
+{
+#if !defined(MULTITHREADING) || !CT_ENABLE_GROWING
+	(void)trie;
+	return 0;
+#else
+	// Fast path: try to become the unique resizer
+	int expected = 0;
+	if (!__atomic_compare_exchange_n(&(trie->resizing),
+	                                 &expected, 1,
+	                                 0,
+	                                 __ATOMIC_ACQ_REL,
+	                                 __ATOMIC_ACQUIRE)) {
+		// Someone else is already resizing. Wait for it to finish.
+		while (__atomic_load_n(&(trie->resizing), __ATOMIC_ACQUIRE) != 0) {
+			// spin
+		}
+		return 1; // from our point of view, resize "succeeded"
+	}
+
+	// At this point, we are the resizer; resizing == 1.
+	// We were called from inside a public op that already called ct_enter_op,
+	// so drop our own active_ops contribution temporarily.
+	__atomic_fetch_sub(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+
+	// Wait until all other operations have drained
+	while (__atomic_load_n(&(trie->active_ops), __ATOMIC_ACQUIRE) != 0) {
+		// spin
+	}
+
+	// No other threads are touching this trie now.
+
+	// Compute new number of cells / buckets
+	uint64_t old_num_cells = trie->num_buckets * CUCKOO_BUCKET_SIZE;
+	uint64_t new_num_cells = old_num_cells * CT_GROWTH_FACTOR;
+
+	cuckoo_trie* new_trie = ct_alloc(new_num_cells);
+	if (!new_trie) {
+		// Failed to allocate; restore state and bail out
+		__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
+		__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+		return 0;
+	}
+
+	// Migrate contents
+	int mig_res = migrate_all_keys(trie, new_trie);
+	if (mig_res != SI_OK) {
+		// Migration failed; free new_trie and abort resize
+		ct_free(new_trie);
+		__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
+		__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+		return 0;
+	}
+
+	// Swap in new buckets & metadata
+	ct_bucket* old_buckets = trie->buckets;
+	uint64_t old_num_buckets = trie->num_buckets;
+
+	trie->buckets         = new_trie->buckets;
+	trie->min_leaf_bucket = new_trie->min_leaf_bucket;
+	trie->num_buckets     = new_trie->num_buckets;
+	trie->num_pairs       = new_trie->num_pairs;
+	trie->num_shuffle_blocks = new_trie->num_shuffle_blocks;
+	trie->is_empty        = new_trie->is_empty;
+
+	// Copy bucket_mix_table contents
+	memcpy(trie->bucket_mix_table,
+	       new_trie->bucket_mix_table,
+	       sizeof(trie->bucket_mix_table));
+
+	// We have stolen the buckets mapping from new_trie; only free its struct
+	new_trie->buckets = NULL;
+	ct_free(new_trie);
+
+	// Free old buckets mapping
+	uint64_t buckets_pages = (old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
+	munmap(old_buckets, buckets_pages * HUGEPAGE_SIZE);
+
+	// Done resizing: let new operations in and restore our active_ops count
+	__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
+	__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+
+	return 1;
+#endif
+}
+
 
 cuckoo_trie* ct_alloc(uint64_t num_cells) {
 	uint64_t num_buckets = (num_cells + CUCKOO_BUCKET_SIZE - 1) / CUCKOO_BUCKET_SIZE;
@@ -2268,6 +2465,11 @@ cuckoo_trie* ct_alloc(uint64_t num_cells) {
 	result->is_empty = 1;
 	init_bucket_mix_table(result);
 	init_buckets(result);
+
+#ifdef MULTITHREADING
+	result->active_ops = 0;
+	result->resizing   = 0;
+#endif
 	return result;
 }
 

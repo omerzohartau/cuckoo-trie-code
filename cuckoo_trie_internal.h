@@ -145,6 +145,14 @@ struct cuckoo_trie {
 	uint64_t num_shuffle_blocks;
 	uint64_t bucket_mix_table[1 << TAG_BITS];
 	int is_empty;
+
+#ifdef MULTITHREADING
+	// Number of active public operations (insert/lookup/update/iter) on this trie
+	uint64_t active_ops;
+
+	// 0 = no resize, 1 = resize in progress
+	int resizing;
+#endif
 };
 
 static inline ct_entry_storage* trie_min_leaf(cuckoo_trie* trie) {

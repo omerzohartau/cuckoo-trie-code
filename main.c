@@ -2250,10 +2250,29 @@ ct_kv* ct_iter_next(ct_iter* iter) {
 #ifdef MULTITHREADING
 			// The linked list was changed. Recompute iter->leaves to point to consecutive
 			// leaves.
+			// NOTE: must NOT call the public ct_iter_goto here — it calls ct_enter_op,
+			// which deadlocks with a concurrent ct_grow: ct_grow sets resizing=1 and
+			// waits for active_ops==0, but this function already holds an active_ops
+			// count from our own ct_enter_op at the top, so the inner ct_enter_op
+			// would spin on resizing==0 forever.
+			// Inline the body of ct_iter_goto without the ct_enter_op/ct_exit_op pair.
 			ct_kv* last_reported_key = entry_kv(&(iter_max_leaf(iter)->value));
-			ct_iter_goto(iter, kv_key_size(last_reported_key), kv_key_bytes(last_reported_key));
-			assert(iter->report_current);
-			iter->report_current = 0;
+			int gr;
+			while (1) {
+				gr = ct_iter_goto_internal(iter,
+				                           kv_key_size(last_reported_key),
+				                           kv_key_bytes(last_reported_key));
+				if (gr == SI_RETRY) continue;
+				if (iter->leaves[0].value.next_leaf.primary_bucket == ((uint32_t)-1))
+					iter->is_exhausted = 1;
+				if (iter->is_exhausted)
+					goto out;
+				gr = ct_iter_next_internal(iter);
+				if (gr == SI_RETRY) continue;
+				break;
+			}
+			// iter_max_leaf is now last_reported_key; the outer loop will call
+			// ct_iter_next_internal to advance past it.
 			continue;
 #else
 			assert(0);

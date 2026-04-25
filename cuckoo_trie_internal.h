@@ -152,6 +152,12 @@ struct cuckoo_trie {
 
 	// 0 = no resize, 1 = resize in progress
 	int resizing;
+
+	// 1 while phase-1 (concurrent) migration is in progress, 0 otherwise
+	int growing;
+
+	// The new table being built during phase-1; valid while growing == 1
+	cuckoo_trie* new_trie_ptr;
 #endif
 };
 

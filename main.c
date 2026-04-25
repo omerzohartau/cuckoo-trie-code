@@ -2357,7 +2357,11 @@ int migrate_all_keys(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
 	return SI_OK;
 }
 
-// Grow the trie by allocating a larger backing table and migrating all keys.
+// Grow the trie using a two-phase approach:
+//   Phase 1 (concurrent): migrate all keys into a new table while other threads
+//     continue to operate on the old table (resizing == 0 during this phase).
+//   Phase 2 (brief stop-the-world): mop up any keys inserted during phase 1,
+//     then swap the table pointer.
 // Returns 1 on success (or if another thread already grew it), 0 on failure.
 int ct_grow(cuckoo_trie* trie)
 {
@@ -2365,81 +2369,93 @@ int ct_grow(cuckoo_trie* trie)
 	(void)trie;
 	return 0;
 #else
-	// Fast path: try to become the unique resizer
+
+	// Elect the unique resizer via growing flag.
 	int expected = 0;
-	if (!__atomic_compare_exchange_n(&(trie->resizing),
+	if (!__atomic_compare_exchange_n(&trie->growing,
 	                                 &expected, 1,
 	                                 0,
 	                                 __ATOMIC_ACQ_REL,
 	                                 __ATOMIC_ACQUIRE)) {
-		// Someone else is already resizing. Wait for it to finish.
-		while (__atomic_load_n(&(trie->resizing), __ATOMIC_ACQUIRE) != 0) {
-			// spin
-		}
-		return 1; // from our point of view, resize "succeeded"
+		// Another thread is already growing; wait for it to finish.
+		while (__atomic_load_n(&trie->growing, __ATOMIC_ACQUIRE) != 0)
+			;  // spin
+		// The table has been swapped; our caller will retry the insert.
+		return 1;
 	}
 
-	// At this point, we are the resizer; resizing == 1.
-	// We were called from inside a public op that already called ct_enter_op,
-	// so drop our own active_ops contribution temporarily.
-	__atomic_fetch_sub(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
-
-	// Wait until all other operations have drained
-	while (__atomic_load_n(&(trie->active_ops), __ATOMIC_ACQUIRE) != 0) {
-		// spin
-	}
-
-	// No other threads are touching this trie now.
-
-	// Compute new number of cells / buckets
+	// Allocate new table (no stop-the-world needed yet).
 	uint64_t old_num_cells = trie->num_buckets * CUCKOO_BUCKET_SIZE;
 	uint64_t new_num_cells = old_num_cells * CT_GROWTH_FACTOR;
 
 	cuckoo_trie* new_trie = ct_alloc(new_num_cells);
 	if (!new_trie) {
-		// Failed to allocate; restore state and bail out
-		__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
-		__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
 		return 0;
 	}
+	trie->new_trie_ptr = new_trie;   // only the resizer reads/writes this
 
-	// Migrate contents
+	// Phase 1: concurrent migration.
+	// Other threads continue operating on `trie` (resizing == 0).
+	// Keys inserted concurrently may land in positions we already passed;
+	// those are caught by the mop-up pass in phase 2.
 	int mig_res = migrate_all_keys(trie, new_trie);
 	if (mig_res != SI_OK) {
-		// Migration failed; free new_trie and abort resize
 		ct_free(new_trie);
-		__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
-		__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+		trie->new_trie_ptr = NULL;
+		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
 		return 0;
 	}
 
-	// Swap in new buckets & metadata
-	ct_bucket* old_buckets = trie->buckets;
-	uint64_t old_num_buckets = trie->num_buckets;
+	// Phase 2: brief stop-the-world.
+	// Drop our own active_ops count so the drain can reach zero.
+	__atomic_fetch_sub(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
 
-	trie->buckets         = new_trie->buckets;
-	trie->min_leaf_bucket = new_trie->min_leaf_bucket;
-	trie->num_buckets     = new_trie->num_buckets;
-	trie->num_pairs       = new_trie->num_pairs;
+	// Block new operations.
+	__atomic_store_n(&trie->resizing, 1, __ATOMIC_RELEASE);
+
+	// Wait for all other ops to drain.
+	while (__atomic_load_n(&trie->active_ops, __ATOMIC_ACQUIRE) != 0)
+		;  // spin
+
+	// Mop-up: insert anything added to old trie during phase 1.
+	// SI_EXISTS is returned for keys already migrated; those are skipped.
+	mig_res = migrate_all_keys(trie, new_trie);
+	if (mig_res != SI_OK) {
+		ct_free(new_trie);
+		trie->new_trie_ptr = NULL;
+		__atomic_store_n(&trie->resizing, 0, __ATOMIC_RELEASE);
+		__atomic_fetch_add(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
+		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
+		return 0;
+	}
+
+	// Swap table fields (no concurrent readers; we own the world).
+	ct_bucket* old_buckets     = trie->buckets;
+	uint64_t   old_num_buckets = trie->num_buckets;
+
+	trie->buckets            = new_trie->buckets;
+	trie->min_leaf_bucket    = new_trie->min_leaf_bucket;
+	trie->num_buckets        = new_trie->num_buckets;
+	trie->num_pairs          = new_trie->num_pairs;
 	trie->num_shuffle_blocks = new_trie->num_shuffle_blocks;
-	trie->is_empty        = new_trie->is_empty;
-
-	// Copy bucket_mix_table contents
-	memcpy(trie->bucket_mix_table,
-	       new_trie->bucket_mix_table,
+	trie->is_empty           = new_trie->is_empty;
+	memcpy(trie->bucket_mix_table, new_trie->bucket_mix_table,
 	       sizeof(trie->bucket_mix_table));
 
-	// We have stolen the buckets mapping from new_trie; only free its struct
+	// Detach bucket array from new_trie so ct_free doesn't unmap it.
 	new_trie->buckets = NULL;
 	ct_free(new_trie);
+	trie->new_trie_ptr = NULL;
 
-	// Free old buckets mapping
-	uint64_t buckets_pages = (old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
-	munmap(old_buckets, buckets_pages * HUGEPAGE_SIZE);
+	// Free old bucket array.
+	uint64_t old_pages = (old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
+	munmap(old_buckets, old_pages * HUGEPAGE_SIZE);
 
-	// Done resizing: let new operations in and restore our active_ops count
-	__atomic_store_n(&(trie->resizing), 0, __ATOMIC_RELEASE);
-	__atomic_fetch_add(&(trie->active_ops), 1, __ATOMIC_ACQ_REL);
+	// Release: let new operations in and restore our active_ops count.
+	__atomic_store_n(&trie->growing,  0, __ATOMIC_RELEASE);
+	__atomic_store_n(&trie->resizing, 0, __ATOMIC_RELEASE);
+	__atomic_fetch_add(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
 
 	return 1;
 #endif
@@ -2486,14 +2502,18 @@ cuckoo_trie* ct_alloc(uint64_t num_cells) {
 	init_buckets(result);
 
 #ifdef MULTITHREADING
-	result->active_ops = 0;
-	result->resizing   = 0;
+	result->active_ops   = 0;
+	result->resizing     = 0;
+	result->growing      = 0;
+	result->new_trie_ptr = NULL;
 #endif
 	return result;
 }
 
 void ct_free(cuckoo_trie* trie) {
-	uint64_t buckets_pages = (trie->num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
-	munmap(trie->buckets, buckets_pages * HUGEPAGE_SIZE);
+	if (trie->buckets) {
+		uint64_t buckets_pages = (trie->num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
+		munmap(trie->buckets, buckets_pages * HUGEPAGE_SIZE);
+	}
 	free(trie);
 }

@@ -2377,10 +2377,14 @@ int ct_grow(cuckoo_trie* trie)
 	                                 0,
 	                                 __ATOMIC_ACQ_REL,
 	                                 __ATOMIC_ACQUIRE)) {
-		// Another thread is already growing; wait for it to finish.
+		// Another thread is already growing.
+		// Release our active_ops count so the resizer's Phase 2 drain can reach zero.
+		// If we keep it, the resizer spins forever waiting for active_ops == 0.
+		__atomic_fetch_sub(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
 		while (__atomic_load_n(&trie->growing, __ATOMIC_ACQUIRE) != 0)
 			;  // spin
-		// The table has been swapped; our caller will retry the insert.
+		// Re-register as an active op on the grown trie.
+		ct_enter_op(trie);
 		return 1;
 	}
 

@@ -36,6 +36,7 @@ EXPORT void ct_enable_debug_logs();
 EXPORT void ct_mtdbg_start();
 EXPORT void ct_mtdbg_register_thread(pthread_t thread_id);
 EXPORT void ct_mtdbg_set_enabled(int enabled);
+EXPORT int ct_mtdbg_get_enabled(void);
 EXPORT void ct_mtdbg_thread_done();
 EXPORT void ct_mtdbg_seed(uint64_t seed);
 

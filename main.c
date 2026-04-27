@@ -2388,7 +2388,10 @@ int ct_grow(cuckoo_trie* trie)
 	// Phase 1 migration and the Phase 2 active_ops drain both involve raw spins
 	// and cross-thread coordination that don't yield the mt_debug token; leaving
 	// it enabled causes a deadlock between the resizer and any concurrent reader.
-	ct_mtdbg_set_enabled(0);
+	// Save the state so we restore exactly what was set (not all callers enable it).
+	int mtdbg_was_on = ct_mtdbg_get_enabled();
+	if (mtdbg_was_on)
+		ct_mtdbg_set_enabled(0);
 
 	// Allocate new table (no stop-the-world needed yet).
 	uint64_t old_num_cells = trie->num_buckets * CUCKOO_BUCKET_SIZE;
@@ -2396,7 +2399,8 @@ int ct_grow(cuckoo_trie* trie)
 
 	cuckoo_trie* new_trie = ct_alloc(new_num_cells);
 	if (!new_trie) {
-		ct_mtdbg_set_enabled(1);
+		if (mtdbg_was_on)
+			ct_mtdbg_set_enabled(1);
 		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
 		return 0;
 	}
@@ -2410,7 +2414,8 @@ int ct_grow(cuckoo_trie* trie)
 	if (mig_res != SI_OK) {
 		ct_free(new_trie);
 		trie->new_trie_ptr = NULL;
-		ct_mtdbg_set_enabled(1);
+		if (mtdbg_was_on)
+			ct_mtdbg_set_enabled(1);
 		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
 		return 0;
 	}
@@ -2432,7 +2437,8 @@ int ct_grow(cuckoo_trie* trie)
 	if (mig_res != SI_OK) {
 		ct_free(new_trie);
 		trie->new_trie_ptr = NULL;
-		ct_mtdbg_set_enabled(1);
+		if (mtdbg_was_on)
+			ct_mtdbg_set_enabled(1);
 		__atomic_store_n(&trie->resizing, 0, __ATOMIC_RELEASE);
 		__atomic_fetch_add(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
 		__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
@@ -2461,9 +2467,9 @@ int ct_grow(cuckoo_trie* trie)
 	uint64_t old_pages = (old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
 	munmap(old_buckets, old_pages * HUGEPAGE_SIZE);
 
-	// Re-enable the mt_debug serializer before releasing locks so that
-	// subsequent operations are serialized again.
-	ct_mtdbg_set_enabled(1);
+	// Restore the mt_debug serializer state.
+	if (mtdbg_was_on)
+		ct_mtdbg_set_enabled(1);
 
 	// Release: let new operations in and restore our active_ops count.
 	__atomic_store_n(&trie->growing,  0, __ATOMIC_RELEASE);

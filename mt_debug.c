@@ -140,6 +140,10 @@ void ct_mtdbg_set_enabled(int enabled) {
 	pthread_cond_broadcast(&running_thread_changed);
 }
 
+int ct_mtdbg_get_enabled(void) {
+	return __atomic_load_n(&mt_debug_enabled, __ATOMIC_ACQUIRE);
+}
+
 void ct_mtdbg_seed(uint64_t seed) {
 	rand_state = seed;
 }

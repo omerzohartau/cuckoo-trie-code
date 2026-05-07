@@ -1946,8 +1946,13 @@ int ct_insert(cuckoo_trie* trie, ct_kv* kv) {
 
 	do {
 		ret = ct_insert_internal(trie, kv, 0);
-		if (ret == SI_RETRY)
+		if (ret == SI_RETRY) {
 			debug_log("Insert retry\n");
+			ct_exit_op(trie);
+			while (__atomic_load_n(&trie->growing, __ATOMIC_ACQUIRE))
+				;
+			ct_enter_op(trie);
+		}
 	} while (ret == SI_RETRY);
 
 	if (ret == SI_FAIL)
@@ -1975,8 +1980,13 @@ int ct_upsert(cuckoo_trie* trie, ct_kv* kv, int* created_new) {
 
 	do {
 		ret = ct_insert_internal(trie, kv, 1);
-		if (ret == SI_RETRY)
+		if (ret == SI_RETRY) {
 			debug_log("Insert retry\n");
+			ct_exit_op(trie);
+			while (__atomic_load_n(&trie->growing, __ATOMIC_ACQUIRE))
+				;
+			ct_enter_op(trie);
+		}
 	} while (ret == SI_RETRY);
 
 	if (ret == SI_FAIL) {

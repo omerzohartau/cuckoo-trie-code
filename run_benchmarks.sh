@@ -51,8 +51,8 @@ ALL_SOURCES="main.c util.c verify_trie.c random.c atomics.c mt_debug.c
              benchmark.c dataset.c random_dist.c"
 CC="${CC:-gcc}"
 FLAGS="-march=haswell -Wreturn-type -Wuninitialized -Wunused-parameter \
-       -O3 -fvisibility=hidden -fno-strict-aliasing -DNDEBUG \
-       -lpthread -lm"
+       -O3 -fvisibility=hidden -fno-strict-aliasing -DNDEBUG"
+LIBS="-lpthread -lm"
 
 echo "--- Building benchmark_base (CT_ENABLE_GROWING=0) ---" | tee -a "$LOG"
 (
@@ -60,7 +60,7 @@ echo "--- Building benchmark_base (CT_ENABLE_GROWING=0) ---" | tee -a "$LOG"
   cp config.h config.h.bak
   sed 's/#define CT_ENABLE_GROWING 1/#define CT_ENABLE_GROWING 0/' config.h.bak > config.h
   # shellcheck disable=SC2086
-  $CC $FLAGS -o benchmark_base $ALL_SOURCES 2>&1 | tee -a "$LOG"
+  $CC $FLAGS -o benchmark_base $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
   cp config.h.bak config.h
   rm config.h.bak
 )
@@ -69,7 +69,7 @@ echo "--- Building benchmark_modified (CT_ENABLE_GROWING=1) ---" | tee -a "$LOG"
 (
   cd "$SCRIPT_DIR"
   # shellcheck disable=SC2086
-  $CC $FLAGS -o benchmark_modified $ALL_SOURCES 2>&1 | tee -a "$LOG"
+  $CC $FLAGS -o benchmark_modified $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
 )
 
 BASE="$SCRIPT_DIR/benchmark_base"

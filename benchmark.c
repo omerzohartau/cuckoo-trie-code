@@ -1127,6 +1127,139 @@ void bench_ycsb(char* dataset_name, uint64_t trie_size, const ycsb_workload_spec
 	timer_report_mt(&timer, spec.num_ops * num_threads, num_threads);
 }
 
+// ---- mt-insert-timeseries benchmark ----
+
+typedef struct {
+	cuckoo_trie* trie;
+	uint64_t num_kvs;
+	uint8_t* target_kvs;
+	volatile uint64_t* shared_ops;
+} timeseries_worker_ctx;
+
+void* timeseries_insert_worker(void* arg) {
+	timeseries_worker_ctx* ctx = (timeseries_worker_ctx*) arg;
+	uint8_t* buf_pos = ctx->target_kvs;
+	for (uint64_t i = 0; i < ctx->num_kvs; i++) {
+		ct_kv* kv = (ct_kv*) buf_pos;
+		int result = ct_insert(ctx->trie, kv);
+		if (result != S_OK && result != S_ALREADYIN) {
+			printf("timeseries insert error %d at key %lu\n", result, i);
+			return NULL;
+		}
+		buf_pos += kv_size(kv);
+		__atomic_fetch_add(ctx->shared_ops, 1, __ATOMIC_RELAXED);
+		speculation_barrier();
+	}
+	return NULL;
+}
+
+typedef struct {
+	cuckoo_trie* trie;
+	volatile uint64_t* shared_ops;
+	stopwatch_t* global_timer;
+	volatile int done;
+	int interval_ms;
+} timeseries_sampler_ctx;
+
+void* timeseries_sampler_thread(void* arg) {
+	timeseries_sampler_ctx* ctx = (timeseries_sampler_ctx*) arg;
+	uint64_t last_ops = 0;
+	uint64_t last_sample_ms = 0;
+	int last_growing = 0;
+
+	while (!__atomic_load_n(&ctx->done, __ATOMIC_ACQUIRE)) {
+		struct timespec req = {0, 1000000};  /* 1ms */
+		nanosleep(&req, NULL);
+
+		uint64_t now_ms = (uint64_t)(timer_seconds(ctx->global_timer) * 1000.0);
+
+#ifdef MULTITHREADING
+		int growing_now = __atomic_load_n(&ctx->trie->growing, __ATOMIC_ACQUIRE);
+		if (!last_growing && growing_now) {
+			printf("RESIZE_START: t_ms=%lu\n", now_ms);
+			fflush(stdout);
+			last_growing = 1;
+		} else if (last_growing && !growing_now) {
+			printf("RESIZE_END: t_ms=%lu\n", now_ms);
+			fflush(stdout);
+			last_growing = 0;
+		}
+#endif
+
+		if (now_ms >= last_sample_ms + (uint64_t)ctx->interval_ms) {
+			uint64_t ops_now = __atomic_load_n(ctx->shared_ops, __ATOMIC_RELAXED);
+			uint64_t delta_ops = ops_now - last_ops;
+			printf("TIMESERIES_SAMPLE: t_ms=%lu ops=%lu\n", now_ms, delta_ops);
+			fflush(stdout);
+			last_ops = ops_now;
+			last_sample_ms = now_ms;
+		}
+	}
+	return NULL;
+}
+
+void bench_mt_insert_timeseries(char* dataset_name, uint64_t trie_size, int num_threads, int interval_ms) {
+	uint64_t i;
+	int result;
+	stopwatch_t timer;
+	volatile uint64_t shared_ops = 0;
+	volatile int sampler_done = 0;
+	dataset_t dataset;
+
+	timeseries_worker_ctx worker_ctxs[num_threads];
+	timeseries_sampler_ctx sampler_ctx;
+	pthread_t workers[num_threads];
+	pthread_t sampler;
+
+	seed_from_time();
+	printf("Reading dataset...\n");
+	init_dataset(&dataset, dataset_name, DATASET_ALL_KEYS);
+	build_kvs(&dataset, DEFAULT_VALUE_SIZE);
+
+	cuckoo_trie* trie = alloc_trie(&dataset, trie_size);
+
+	uint64_t workload_start = 0;
+	for (i = 0; i < (uint64_t)num_threads; i++) {
+		uint64_t workload_end = dataset.num_keys * (i + 1) / num_threads;
+		worker_ctxs[i].trie = trie;
+		worker_ctxs[i].target_kvs = (uint8_t*) dataset.kv_pointers[workload_start];
+		worker_ctxs[i].num_kvs = workload_end - workload_start;
+		worker_ctxs[i].shared_ops = &shared_ops;
+		workload_start = workload_end;
+	}
+
+	sampler_ctx.trie = trie;
+	sampler_ctx.shared_ops = &shared_ops;
+	sampler_ctx.global_timer = &timer;
+	sampler_ctx.done = 0;
+	sampler_ctx.interval_ms = interval_ms;
+
+	printf("Starting timeseries insert (%d threads, %dms sample interval)...\n",
+	       num_threads, interval_ms);
+	notify_critical_section_start();
+	timer_start(&timer);
+
+	result = pthread_create(&sampler, NULL, timeseries_sampler_thread, &sampler_ctx);
+	if (result != 0) { printf("Sampler thread error %d\n", result); return; }
+
+	for (i = 0; i < (uint64_t)num_threads; i++) {
+		result = pthread_create(&workers[i], NULL, timeseries_insert_worker, &worker_ctxs[i]);
+		if (result != 0) { printf("Worker thread error %d\n", result); return; }
+	}
+
+	for (i = 0; i < (uint64_t)num_threads; i++)
+		pthread_join(workers[i], NULL);
+
+	__atomic_store_n(&sampler_ctx.done, 1, __ATOMIC_RELEASE);
+	pthread_join(sampler, NULL);
+
+	notify_critical_section_end();
+	float total_time = timer_seconds(&timer);
+	uint64_t total_ops = __atomic_load_n(&shared_ops, __ATOMIC_RELAXED);
+	printf("RESULT: ops=%lu threads=%d ms=%d\n", total_ops, num_threads, (int)(total_time * 1000));
+	(void)sampler_done;
+}
+
 int main(int argc, char** argv) {
 	int i;
 	dataset_t dataset;
@@ -1221,6 +1354,10 @@ int main(int argc, char** argv) {
 		return 0;
 	} else if (!strcmp(benchmark_name, "mt-insert")) {
 		bench_mw_insert(dataset_name, trie_cells, num_threads);
+		return 0;
+	} else if (!strcmp(benchmark_name, "mt-insert-timeseries")) {
+		int interval_ms = 200;
+		bench_mt_insert_timeseries(dataset_name, trie_cells, num_threads, interval_ms);
 		return 0;
 	}
 	else if (!strcmp(benchmark_name, "ycsb-a")) {

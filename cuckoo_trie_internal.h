@@ -156,8 +156,22 @@ struct cuckoo_trie {
 	// 1 while phase-1 (concurrent) migration is in progress, 0 otherwise
 	int growing;
 
-	// The new table being built during phase-1; valid while growing == 1
+	// The new table being built during growing; valid while growing == 1
 	cuckoo_trie* new_trie_ptr;
+
+	// Running count of entries in this table. Incremented on each successful
+	// insert; used to trigger grow before the table reaches 100% occupancy.
+	uint64_t num_entries;
+
+	// Cooperative migration cursor: packed ct_entry_locator of the next leaf to
+	// migrate.  Threads atomically advance it (CAS) and migrate the claimed entry.
+	// Initialized to the first leaf when growing starts; CURSOR_DONE when finished.
+	uint64_t migrate_cursor;
+
+	// Previous bucket array kept alive after a no-stop-the-world swap so that
+	// in-flight reads can complete safely.  Freed in ct_free.
+	ct_bucket* old_buckets;
+	uint64_t   old_num_buckets;
 #endif
 };
 

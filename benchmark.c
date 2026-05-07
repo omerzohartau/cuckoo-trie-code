@@ -308,7 +308,20 @@ void* insert_thread(void* context) {
 	for (i = 0; i < ctx->num_kvs; i++) {
 		ct_kv* kv = (ct_kv*) buf_pos;
 		result = ct_insert(ctx->trie, kv);
-		if (result != S_OK) {
+		if (result == S_ALREADYIN) {
+			// Print up to 5 duplicate keys then keep going (don't abort).
+			static int dup_count = 0;
+			if (__atomic_fetch_add(&dup_count, 1, __ATOMIC_RELAXED) < 5) {
+				printf("Duplicate key (%lu bytes):", kv_key_size(kv));
+				for (uint64_t b = 0; b < kv_key_size(kv); b++)
+					printf(" %02x", kv_key_bytes(kv)[b]);
+				ct_kv* found = ct_lookup(ctx->trie, kv_key_size(kv), kv_key_bytes(kv));
+				printf("  -> lookup=%s\n", found ? "FOUND (confirmed duplicate)" : "NOT FOUND (unexpected)");
+			}
+			buf_pos += kv_size(kv);
+			speculation_barrier();
+			continue;
+		} else if (result != S_OK) {
 			printf("Insertion error %d\n", result);
 			return NULL;
 		}

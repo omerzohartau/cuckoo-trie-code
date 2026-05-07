@@ -2422,18 +2422,22 @@ static void help_migrate_batch(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
 	}
 }
 
-// Grow the trie without stop-the-world, using cooperative migration:
+// Grow the trie with cooperative migration and a minimal swap-only drain:
 //
-//   1. Resizer allocates a new 2x table, initialises the migration cursor to
-//      the first leaf, then publishes new_trie_ptr.
+//   1. Resizer allocates a new 2x table, initialises the migration cursor, then
+//      publishes new_trie_ptr.
 //   2. While growing==1, every new insert is redirected to new_trie (in
 //      ct_insert_internal), so the old table is frozen — one migration pass
-//      is sufficient, no mop-up needed.
-//   3. All threads — resizer and helpers — advance migrate_cursor via CAS
-//      and migrate claimed entries cooperatively.
-//   4. Once the cursor hits the end-of-list sentinel, the resizer swaps the
-//      table fields and sets growing=0.  Old buckets are kept alive until
-//      ct_free (deferred free) so in-flight reads complete safely.
+//      is sufficient with no mop-up.
+//   3. All threads — resizer and helpers — advance migrate_cursor via CAS and
+//      migrate claimed entries cooperatively.
+//   4. Once migration is complete, the resizer briefly drains active_ops to
+//      ensure no in-flight read holds a stale locator (bucket index from the old
+//      table) across the swap.  Because inserts were redirected throughout, only
+//      very short-lived reads remain; the drain is nanoseconds, not O(N).
+//   5. Resizer swaps table fields and releases.  Old buckets are deferred to
+//      ct_free.  The new_trie struct is also deferred (helpers may still hold a
+//      local pointer to it).
 //
 // Returns 1 on success (or if another thread already grew it), 0 on failure.
 int ct_grow(cuckoo_trie* trie)
@@ -2478,6 +2482,13 @@ int ct_grow(cuckoo_trie* trie)
 		return 0;
 	}
 
+	// Free the new_trie struct from a prior grow — by now all helpers that held a
+	// local pointer to it have long since finished (a full grow cycle has elapsed).
+	if (trie->old_new_trie) {
+		free(trie->old_new_trie);
+		trie->old_new_trie = NULL;
+	}
+
 	// Initialise migration cursor to the first leaf entry.
 	ct_entry_local_copy head;
 	read_min_leaf(trie, &head);
@@ -2494,9 +2505,21 @@ int ct_grow(cuckoo_trie* trie)
 
 	// All entries present in old table at growing=1 are now in new_trie.
 	// Entries inserted after growing=1 were redirected to new_trie directly.
-	// No stop-the-world and no mop-up pass needed.
+	// No mop-up pass needed.
 
-	// Swap table fields.
+	// Drain in-flight ops before swapping trie->buckets.
+	// Locators (ct_entry_locator.primary_bucket) encode bucket indices specific to
+	// the table they were read from.  An op that started on old table and holds a
+	// locator must complete before we change trie->buckets and trie->num_buckets,
+	// otherwise it would search the new bucket array with a stale index.
+	// Because inserts have been redirected to new_trie throughout migration, the
+	// only remaining ops are fast reads; this drain takes nanoseconds.
+	__atomic_fetch_sub(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
+	__atomic_store_n(&trie->resizing, 1, __ATOMIC_RELEASE);
+	while (__atomic_load_n(&trie->active_ops, __ATOMIC_ACQUIRE) != 0)
+		;
+
+	// Swap table fields (no concurrent readers holding old-table locators now).
 	ct_bucket* old_buckets     = trie->buckets;
 	uint64_t   old_num_buckets = trie->num_buckets;
 
@@ -2510,15 +2533,12 @@ int ct_grow(cuckoo_trie* trie)
 	memcpy(trie->bucket_mix_table, new_trie->bucket_mix_table,
 	       sizeof(trie->bucket_mix_table));
 
-	// Null new_trie_ptr before freeing new_trie's shell so no thread can
-	// follow a dangling pointer.
+	// Clear new_trie_ptr: inserts redirected here have already completed.
 	__atomic_store_n(&trie->new_trie_ptr, NULL, __ATOMIC_RELEASE);
-	new_trie->buckets = NULL;   // prevent ct_free from unmapping the bucket array
-	ct_free(new_trie);
 
-	// Deferred free: old buckets may still be referenced by in-flight reads.
-	// Keep the previous old_buckets from an earlier grow too; free it now since
-	// enough time has passed (a full grow cycle) for any such reads to finish.
+	// Deferred free: old buckets and the new_trie struct are kept alive until
+	// ct_free (or the next grow, by which time all prior accesses are done).
+	// Free any leftovers from a previous grow first.
 	if (trie->old_buckets) {
 		uint64_t pg = (trie->old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
 		munmap(trie->old_buckets, pg * HUGEPAGE_SIZE);
@@ -2526,11 +2546,18 @@ int ct_grow(cuckoo_trie* trie)
 	trie->old_buckets     = old_buckets;
 	trie->old_num_buckets = old_num_buckets;
 
+	if (trie->old_new_trie)
+		free(trie->old_new_trie);
+	new_trie->buckets  = NULL;   // already swapped into trie; don't munmap again
+	trie->old_new_trie = new_trie;
+
 	if (mtdbg_was_on)
 		ct_mtdbg_set_enabled(1);
 
-	// Signal completion — new ops see growing==0 and use the swapped trie fields.
-	__atomic_store_n(&trie->growing, 0, __ATOMIC_RELEASE);
+	// Release.
+	__atomic_store_n(&trie->growing,  0, __ATOMIC_RELEASE);
+	__atomic_store_n(&trie->resizing, 0, __ATOMIC_RELEASE);
+	__atomic_fetch_add(&trie->active_ops, 1, __ATOMIC_ACQ_REL);
 
 	return 1;
 #endif
@@ -2585,6 +2612,7 @@ cuckoo_trie* ct_alloc(uint64_t num_cells) {
 	result->migrate_cursor  = (uint64_t)(uint32_t)-1; // CURSOR_DONE (empty table)
 	result->old_buckets     = NULL;
 	result->old_num_buckets = 0;
+	result->old_new_trie    = NULL;
 #endif
 	return result;
 }
@@ -2599,6 +2627,9 @@ void ct_free(cuckoo_trie* trie) {
 		uint64_t old_pages = (trie->old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
 		munmap(trie->old_buckets, old_pages * HUGEPAGE_SIZE);
 	}
+	// Free the new_trie struct from the last grow (buckets already swapped into trie).
+	if (trie->old_new_trie)
+		free(trie->old_new_trie);
 #endif
 	free(trie);
 }

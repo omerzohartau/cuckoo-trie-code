@@ -168,10 +168,15 @@ struct cuckoo_trie {
 	// Initialized to the first leaf when growing starts; CURSOR_DONE when finished.
 	uint64_t migrate_cursor;
 
-	// Previous bucket array kept alive after a no-stop-the-world swap so that
-	// in-flight reads can complete safely.  Freed in ct_free.
+	// Previous bucket array kept alive after swap so that in-flight reads that
+	// hold old-table locators can still find their entries.  Freed in ct_free.
 	ct_bucket* old_buckets;
 	uint64_t   old_num_buckets;
+
+	// new_trie struct from the previous grow, kept alive until non-resizer helpers
+	// that hold a local pointer to it have finished.  Freed in ct_free or at the
+	// next grow (by then, helpers are long done).
+	cuckoo_trie* old_new_trie;
 #endif
 };
 

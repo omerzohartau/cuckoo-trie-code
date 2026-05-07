@@ -494,21 +494,6 @@ void bench_mw_insert(char* dataset_name, uint64_t trie_size, int num_threads) {
 	init_dataset(&dataset, dataset_name, DATASET_ALL_KEYS);
 	build_kvs(&dataset, DEFAULT_VALUE_SIZE);
 
-	// DEBUG: count duplicate keys in raw dataset (no trie involved)
-	{
-		uint64_t dups = 0;
-		cuckoo_trie* dup_trie = ct_alloc(dataset.num_keys * 3);
-		uint8_t* buf_pos = dataset.kvs;
-		for (uint64_t k = 0; k < dataset.num_keys; k++) {
-			ct_kv* kv = (ct_kv*) buf_pos;
-			int r = ct_insert(dup_trie, kv);
-			if (r == S_ALREADYIN) dups++;
-			buf_pos += kv_size(kv);
-		}
-		ct_free(dup_trie);
-		printf("DEBUG: raw dataset has %lu duplicate keys out of %lu total\n", dups, dataset.num_keys);
-	}
-
 	trie = alloc_trie(&dataset, trie_size);
 
 	uint64_t workload_start = 0;

@@ -1855,12 +1855,15 @@ int ct_insert_internal(cuckoo_trie* trie, ct_kv* kv, int is_upsert) {
 	int ret;
 
 #if defined(MULTITHREADING) && CT_ENABLE_GROWING
-	// Cooperative insert redirect: once growing=1, new inserts go directly to
-	// new_trie so the old table stays frozen and migration needs only one pass.
+	// While growing==1 and new_trie_ptr is set, block new inserts rather than
+	// redirecting them into new_trie.  Direct redirect bypasses ct_enter_op on
+	// new_trie, causing active_ops underflow if new_trie itself needs to grow.
+	// Returning SI_RETRY causes the caller to exit active_ops (helping the drain)
+	// and wait for growing==0 before retrying on the swapped-in grown trie.
 	if (__atomic_load_n(&trie->growing, __ATOMIC_ACQUIRE)) {
 		cuckoo_trie* new_t = __atomic_load_n(&trie->new_trie_ptr, __ATOMIC_ACQUIRE);
 		if (new_t)
-			return ct_insert_internal(new_t, kv, is_upsert);
+			return SI_RETRY;
 		// new_trie_ptr is NULL: swap just completed; fall through to use swapped buckets
 	}
 
@@ -2436,14 +2439,14 @@ static void help_migrate_batch(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
 //
 //   1. Resizer allocates a new 2x table, initialises the migration cursor, then
 //      publishes new_trie_ptr.
-//   2. While growing==1, every new insert is redirected to new_trie (in
-//      ct_insert_internal), so the old table is frozen — one migration pass
-//      is sufficient with no mop-up.
+//   2. While growing==1, new inserts (in ct_insert_internal) return SI_RETRY,
+//      causing the caller to exit active_ops and wait for growing==0.  The old
+//      table is therefore frozen — one migration pass is sufficient, no mop-up.
 //   3. All threads — resizer and helpers — advance migrate_cursor via CAS and
 //      migrate claimed entries cooperatively.
 //   4. Once migration is complete, the resizer briefly drains active_ops to
 //      ensure no in-flight read holds a stale locator (bucket index from the old
-//      table) across the swap.  Because inserts were redirected throughout, only
+//      table) across the swap.  Because inserts are blocked throughout, only
 //      very short-lived reads remain; the drain is nanoseconds, not O(N).
 //   5. Resizer swaps table fields and releases.  Old buckets are deferred to
 //      ct_free.  The new_trie struct is also deferred (helpers may still hold a

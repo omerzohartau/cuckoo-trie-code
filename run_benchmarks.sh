@@ -18,10 +18,14 @@ RESULTS_DIR="$SCRIPT_DIR/benchmark_results"
 DATASET_DIR="/specific/disk1/home/datasets"
 DEFAULT_DATASET="$DATASET_DIR/rand_8_200m_escaped.bin"
 
+# Maximum seconds per individual benchmark invocation.
+# Generous (30 min) to cover 1-thread runs on large datasets.
+BENCH_TIMEOUT=1800
+
 RUNS=5
 THREAD_COUNTS="1 2 4 8 12 16 24"
 TIMESERIES_THREADS=4
-# Small initial table: 1M cells -> ~8 doublings across 200M keys
+# Small initial table: 1M cells -> multiple doublings across 200M keys
 SMALL_INITIAL_CELLS=1000000
 
 if [[ "$1" == "--fast" ]]; then
@@ -56,38 +60,67 @@ LIBS="-lpthread -lm"
 
 echo "--- Building benchmark_base (CT_ENABLE_GROWING=0) ---" | tee -a "$LOG"
 (
-  cd "$SCRIPT_DIR"
-  cp config.h config.h.bak
-  sed 's/#define CT_ENABLE_GROWING 1/#define CT_ENABLE_GROWING 0/' config.h.bak > config.h
-  # shellcheck disable=SC2086
-  $CC $FLAGS -o benchmark_base $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
-  cp config.h.bak config.h
-  rm config.h.bak
+    set -e -o pipefail
+    cd "$SCRIPT_DIR"
+    cp config.h config.h.bak
+    trap 'cp config.h.bak config.h 2>/dev/null; rm -f config.h.bak config.h.tmp' EXIT
+    sed 's/#define CT_ENABLE_GROWING 1/#define CT_ENABLE_GROWING 0/' config.h.bak \
+        > config.h.tmp && mv config.h.tmp config.h
+    # shellcheck disable=SC2086
+    $CC $FLAGS -o benchmark_base $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
 )
+BASE="$SCRIPT_DIR/benchmark_base"
+if [[ ! -x "$BASE" ]]; then
+    echo "ERROR: benchmark_base build FAILED. Check $LOG. Aborting." | tee -a "$LOG"
+    exit 1
+fi
 
 echo "--- Building benchmark_modified (CT_ENABLE_GROWING=1) ---" | tee -a "$LOG"
 (
-  cd "$SCRIPT_DIR"
-  # shellcheck disable=SC2086
-  $CC $FLAGS -o benchmark_modified $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
+    set -e -o pipefail
+    cd "$SCRIPT_DIR"
+    # shellcheck disable=SC2086
+    $CC $FLAGS -o benchmark_modified $ALL_SOURCES $LIBS 2>&1 | tee -a "$LOG"
 )
-
-BASE="$SCRIPT_DIR/benchmark_base"
 MODIFIED="$SCRIPT_DIR/benchmark_modified"
+if [[ ! -x "$MODIFIED" ]]; then
+    echo "ERROR: benchmark_modified build FAILED. Check $LOG. Aborting." | tee -a "$LOG"
+    exit 1
+fi
+
 echo "Build done." | tee -a "$LOG"
 echo "" | tee -a "$LOG"
 
 # --------------------------------------------------------------------------
-# Helper: run one benchmark, append matching lines to a result file
+# Helper: run one benchmark with a hard timeout.
+#
 # run_bench LABEL RESULT_FILE BINARY [ARGS...]
+#
+# Captures output to a temp file first so grep doesn't affect the exit code.
+# Warns if the benchmark timed out or exited non-zero; never aborts the script.
 # --------------------------------------------------------------------------
 run_bench() {
     local label="$1"; shift
     local result_file="$1"; shift
     local binary="$1"; shift
+    local tmpout
+    tmpout=$(mktemp)
+
     echo "" | tee -a "$LOG"
     echo ">> $label" | tee -a "$LOG"
-    "$binary" "$@" 2>&1 | tee -a "$LOG" | grep "^RESULT:" >> "$result_file" || true
+
+    timeout "$BENCH_TIMEOUT" "$binary" "$@" > "$tmpout" 2>&1
+    local ec=$?
+    cat "$tmpout" >> "$LOG"
+    grep "^RESULT:" "$tmpout" >> "$result_file" || true
+    rm -f "$tmpout"
+
+    if [[ $ec -eq 124 ]]; then
+        echo "WARNING: $label timed out after ${BENCH_TIMEOUT}s — no RESULT recorded" \
+            | tee -a "$LOG"
+    elif [[ $ec -ne 0 ]]; then
+        echo "WARNING: $label exited with code $ec" | tee -a "$LOG"
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -159,11 +192,22 @@ for run in $(seq 1 $RUNS); do
     echo "# run=$run threads=$TIMESERIES_THREADS" | tee -a "$TS_FILE"
     echo "" | tee -a "$LOG"
     echo ">> timeseries run=$run t=$TIMESERIES_THREADS" | tee -a "$LOG"
-    "$MODIFIED" mt-insert-timeseries \
+    local_tmp=$(mktemp)
+    timeout "$BENCH_TIMEOUT" "$MODIFIED" mt-insert-timeseries \
         --threads "$TIMESERIES_THREADS" \
         --trie-cells "$SMALL_INITIAL_CELLS" "$DATASET" \
-        2>&1 | tee -a "$LOG" \
-        | grep -E "^(TIMESERIES_SAMPLE|RESIZE_START|RESIZE_END|RESULT):" >> "$TS_FILE" || true
+        > "$local_tmp" 2>&1
+    ec=$?
+    cat "$local_tmp" >> "$LOG"
+    grep -E "^(TIMESERIES_SAMPLE|RESIZE_START|RESIZE_END|RESULT):" "$local_tmp" \
+        >> "$TS_FILE" || true
+    rm -f "$local_tmp"
+    if [[ $ec -eq 124 ]]; then
+        echo "WARNING: timeseries run=$run timed out after ${BENCH_TIMEOUT}s" \
+            | tee -a "$LOG"
+    elif [[ $ec -ne 0 ]]; then
+        echo "WARNING: timeseries run=$run exited with code $ec" | tee -a "$LOG"
+    fi
 done
 echo "" | tee -a "$LOG"
 echo "Benchmark 3 complete." | tee -a "$LOG"

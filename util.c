@@ -124,13 +124,12 @@ void* mmap_hugepage(size_t size) {
 	result = mmap(0, size, PROT_READ | PROT_WRITE,
 				  MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (HUGEPAGE_LOG_SIZE << MAP_HUGE_SHIFT),
 				  -1, 0);
-	if (result == NULL) {
-		printf("Very strange - we got the memory at address 0 from mmap\n");
-		return NULL;
-	}
-	if (result == MAP_FAILED) {
-		printf("Failed to allocate %lu bytes in 2048kB huge-pages. Do you have enough free huge-pages?\n", size);
-		return NULL;
+	if (result == NULL || result == MAP_FAILED) {
+		/* Hugepage pool exhausted; fall back to regular anonymous pages. */
+		result = mmap(0, size, PROT_READ | PROT_WRITE,
+					  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (result == NULL || result == MAP_FAILED)
+			return NULL;
 	}
 	return result;
 }

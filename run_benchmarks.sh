@@ -103,14 +103,19 @@ run_bench() {
     local label="$1"; shift
     local result_file="$1"; shift
     local binary="$1"; shift
-    local tmpout
+    local tmpout ec
     tmpout=$(mktemp)
 
     echo "" | tee -a "$LOG"
     echo ">> $label" | tee -a "$LOG"
 
+    # Disable errexit for the benchmark invocation so a crash (exit 139) or
+    # non-zero exit doesn't abort the whole script.
+    set +e
     timeout "$BENCH_TIMEOUT" "$binary" "$@" > "$tmpout" 2>&1
-    local ec=$?
+    ec=$?
+    set -e
+
     cat "$tmpout" >> "$LOG"
     grep "^RESULT:" "$tmpout" >> "$result_file" || true
     rm -f "$tmpout"
@@ -119,7 +124,7 @@ run_bench() {
         echo "WARNING: $label timed out after ${BENCH_TIMEOUT}s — no RESULT recorded" \
             | tee -a "$LOG"
     elif [[ $ec -ne 0 ]]; then
-        echo "WARNING: $label exited with code $ec" | tee -a "$LOG"
+        echo "WARNING: $label exited with code $ec (crashed or overflow)" | tee -a "$LOG"
     fi
 }
 
@@ -193,11 +198,13 @@ for run in $(seq 1 $RUNS); do
     echo "" | tee -a "$LOG"
     echo ">> timeseries run=$run t=$TIMESERIES_THREADS" | tee -a "$LOG"
     local_tmp=$(mktemp)
+    set +e
     timeout "$BENCH_TIMEOUT" "$MODIFIED" mt-insert-timeseries \
         --threads "$TIMESERIES_THREADS" \
         --trie-cells "$SMALL_INITIAL_CELLS" "$DATASET" \
         > "$local_tmp" 2>&1
     ec=$?
+    set -e
     cat "$local_tmp" >> "$LOG"
     grep -E "^(TIMESERIES_SAMPLE|RESIZE_START|RESIZE_END|RESULT):" "$local_tmp" \
         >> "$TS_FILE" || true

@@ -2426,10 +2426,18 @@ static void help_migrate_batch(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
 
 		ct_kv* kv = entry_kv(&cur.value);
 		int ret;
+		ct_enter_op(new_trie);
 		do {
 			ret = ct_insert_internal(new_trie, kv, 0);
+			if (ret == SI_RETRY) {
+				ct_exit_op(new_trie);
+				while (__atomic_load_n(&new_trie->growing, __ATOMIC_ACQUIRE))
+					;
+				ct_enter_op(new_trie);
+			}
 		} while (ret == SI_RETRY);
-		// SI_EXISTS is fine: key was already inserted into new_trie via redirect
+		ct_exit_op(new_trie);
+		// SI_EXISTS is fine: key was already migrated into new_trie
 
 		migrated++;
 	}

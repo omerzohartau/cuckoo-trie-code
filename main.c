@@ -5,29 +5,11 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <immintrin.h>
-#include <signal.h>
-#include <execinfo.h>
 
 #include "cuckoo_trie.h"
 #include "random.h"
 #include "main.h"
 #include "util.h"
-
-static void sigabrt_handler(int sig) {
-	(void)sig;
-	void* bt[64];
-	int n = backtrace(bt, 64);
-	backtrace_symbols_fd(bt, n, 2);
-	signal(SIGABRT, SIG_DFL);
-	raise(SIGABRT);
-}
-__attribute__((constructor)) static void install_sigabrt_handler(void) {
-	struct sigaction sa;
-	sa.sa_handler = sigabrt_handler;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESETHAND;
-	sigaction(SIGABRT, &sa, NULL);
-}
 
 // The root has to have a last symbol in order to have an alternate bucket.
 // The following value was arbitrarily chosen.
@@ -1103,11 +1085,29 @@ int try_descend(ct_finger* finger, uint64_t symbol, int save_path, uint64_t expe
 		finger_extend_prefix_known_hash(finger, symbol, expected_hash);
 		finger->depth_in_jump++;
 		if (finger->depth_in_jump == entry_jump_size(containing_entry)) {
-			// We reached the end of the jump node - move to the child
+			// We reached the end of the jump node - move to the child.
+			// Under concurrent modification the local copy may be stale: use
+			// the bounded try-variant so that a miss triggers a retry (via
+			// create_leaf → upgrade_lock → SI_RETRY) rather than aborting.
+#ifdef MULTITHREADING
+			ct_entry_local_copy saved = finger->containing_entry;
+			if (!find_entry_in_pair_by_color_try(finger->trie, &(finger->containing_entry),
+												 hash_to_bucket(finger->prefix_hash),
+												 hash_to_tag(finger->prefix_hash),
+												 entry_child_color(containing_entry))) {
+				// Child not found — jump node was concurrently modified.
+				// Restore finger state so create_leaf sees a consistent jump
+				// node at depth_in_jump < jump_size and issues SI_RETRY.
+				finger->containing_entry = saved;
+				finger->depth_in_jump--;
+				return 0;
+			}
+#else
 			find_entry_in_pair_by_color(finger->trie, &(finger->containing_entry),
 										hash_to_bucket(finger->prefix_hash),
 										hash_to_tag(finger->prefix_hash),
 										entry_child_color(containing_entry));
+#endif
 			finger_node_changed(finger, save_path);
 		}
 		return 1;

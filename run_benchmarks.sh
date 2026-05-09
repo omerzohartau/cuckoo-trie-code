@@ -55,7 +55,7 @@ ALL_SOURCES="main.c util.c verify_trie.c random.c atomics.c mt_debug.c
              benchmark.c dataset.c random_dist.c"
 CC="${CC:-gcc}"
 FLAGS="-march=haswell -Wreturn-type -Wuninitialized -Wunused-parameter \
-       -O3 -fvisibility=hidden -fno-strict-aliasing -DNDEBUG"
+       -O3 -fvisibility=hidden -fno-strict-aliasing -DNDEBUG -g -rdynamic"
 LIBS="-lpthread -lm"
 
 echo "--- Building benchmark_base (CT_ENABLE_GROWING=0) ---" | tee -a "$LOG"

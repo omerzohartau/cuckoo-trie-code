@@ -5,11 +5,29 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <immintrin.h>
+#include <signal.h>
+#include <execinfo.h>
 
 #include "cuckoo_trie.h"
 #include "random.h"
 #include "main.h"
 #include "util.h"
+
+static void sigabrt_handler(int sig) {
+	(void)sig;
+	void* bt[64];
+	int n = backtrace(bt, 64);
+	backtrace_symbols_fd(bt, n, 2);
+	signal(SIGABRT, SIG_DFL);
+	raise(SIGABRT);
+}
+__attribute__((constructor)) static void install_sigabrt_handler(void) {
+	struct sigaction sa;
+	sa.sa_handler = sigabrt_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESETHAND;
+	sigaction(SIGABRT, &sa, NULL);
+}
 
 // The root has to have a last symbol in order to have an alternate bucket.
 // The following value was arbitrarily chosen.

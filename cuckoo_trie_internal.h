@@ -177,6 +177,11 @@ struct cuckoo_trie {
 	// that hold a local pointer to it have finished.  Freed in ct_free or at the
 	// next grow (by then, helpers are long done).
 	cuckoo_trie* old_new_trie;
+
+	// 1 normally; set to 0 after the bucket array is transferred to another trie
+	// during a grow.  Guards the munmap in ct_free so helpers that still hold a
+	// local new_trie pointer can safely dereference new_trie->buckets until ct_free.
+	int buckets_owned;
 #endif
 };
 

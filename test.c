@@ -3,6 +3,7 @@
 #include <string.h>
 #include <pthread.h>
 
+#include "config.h"
 #include "cuckoo_trie.h"
 #include "random.h"
 #include "dataset.h"
@@ -142,6 +143,8 @@ void test_insert(int verbose) {
 
 		buf_pos += kv_size(kv);
 	}
+	if (i == num_keys)
+		printf("OK!\n");
 }
 
 int kv_ptr_compare(const void* k1_ptr, const void* k2_ptr) {
@@ -370,6 +373,165 @@ void test_mt_insert_lookup() {
 	}
 
 	printf("Done.\n");
+}
+
+// ---- mt-insert-lookup-grow ----
+// Linearizability check during concurrent grows, exercised with multiple writer and
+// reader threads.  If a redirected insert is invisible to a concurrent lookup, a
+// reader will report LINEARIZABILITY VIOLATION and the test will fail.
+//
+// Layout: MT_ILG_WRITERS writer threads each inserting MT_ILG_KEYS_PER_WRITER keys
+// from a disjoint slice of a single large unique-key buffer.  MT_ILG_READERS reader
+// threads each monitor all writers and verify every published key via ct_lookup.
+
+#define MT_ILG_WRITERS       4
+#define MT_ILG_READERS       4
+#define MT_ILG_KEYS_PER_WRITER 5000
+
+typedef struct {
+	cuckoo_trie*       trie;
+	uint8_t*           kvs;           // start of this writer's key slice
+	uint64_t           num_kvs;
+	volatile uint64_t  inserted_count; // published after each successful insert
+	volatile int       writer_done;    // set when writer exits (success or error)
+} mt_ilg_writer_slot;
+
+typedef struct {
+	mt_ilg_writer_slot* slots;
+	int                 num_writers;
+} mt_ilg_reader_arg;
+
+void* mt_ilg_writer_thread(void* arg) {
+	mt_ilg_writer_slot* slot = (mt_ilg_writer_slot*)arg;
+	uint8_t* buf_pos = slot->kvs;
+
+	for (uint64_t i = 0; i < slot->num_kvs; i++) {
+		ct_kv* kv = (ct_kv*)buf_pos;
+		int result = ct_insert(slot->trie, kv);
+		if (result != S_OK) {
+			printf("Error: writer ct_insert returned %d at key %lu\n", result, i);
+			// Publish the count of keys actually inserted so readers stop correctly.
+			__atomic_store_n(&slot->inserted_count, i, __ATOMIC_RELEASE);
+			__atomic_store_n(&slot->writer_done,    1, __ATOMIC_RELEASE);
+			return NULL;
+		}
+		// Publish AFTER the insert is fully visible.
+		__atomic_store_n(&slot->inserted_count, i + 1, __ATOMIC_RELEASE);
+		buf_pos += kv_size(kv);
+	}
+	__atomic_store_n(&slot->writer_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+void* mt_ilg_reader_thread(void* arg) {
+	mt_ilg_reader_arg* rarg = (mt_ilg_reader_arg*)arg;
+	// Per-writer tracking: how many keys this reader has already verified, and the
+	// current position in that writer's key buffer.
+	uint64_t  checked[MT_ILG_WRITERS];
+	uint8_t*  pos[MT_ILG_WRITERS];
+	for (int w = 0; w < rarg->num_writers; w++) {
+		checked[w] = 0;
+		pos[w]     = rarg->slots[w].kvs;
+	}
+
+	uint64_t total_checked = 0;
+	while (1) {
+		int all_done = 1;
+		for (int w = 0; w < rarg->num_writers; w++) {
+			// Load writer_done first: its ACQUIRE synchronises-with the writer's
+			// final RELEASE on inserted_count, guaranteeing we see the last value.
+			int done          = __atomic_load_n(&rarg->slots[w].writer_done,    __ATOMIC_ACQUIRE);
+			uint64_t inserted = __atomic_load_n(&rarg->slots[w].inserted_count, __ATOMIC_ACQUIRE);
+
+			while (checked[w] < inserted) {
+				ct_kv* kv    = (ct_kv*)pos[w];
+				ct_kv* found = ct_lookup(rarg->slots[w].trie,
+				                         kv_key_size(kv), kv_key_bytes(kv));
+				if (found == NULL) {
+					printf("LINEARIZABILITY VIOLATION: writer %d key %lu "
+					       "(ct_insert returned S_OK) but ct_lookup returned NULL\n",
+					       w, checked[w]);
+					return NULL;
+				}
+				pos[w] += kv_size(kv);
+				checked[w]++;
+				total_checked++;
+			}
+			if (!done)
+				all_done = 0;
+		}
+		if (all_done)
+			break;
+	}
+	printf("Reader done. Verified %lu keys.\n", total_checked);
+	return NULL;
+}
+
+void test_mt_insert_lookup_grow(void) {
+#if !defined(MULTITHREADING) || !CT_ENABLE_GROWING
+	printf("SKIP: CT_ENABLE_GROWING not set\n");
+	return;
+#endif
+	const int      num_writers   = MT_ILG_WRITERS;
+	const int      num_readers   = MT_ILG_READERS;
+	const uint64_t keys_per_writer = MT_ILG_KEYS_PER_WRITER;
+	const uint64_t total_keys    = (uint64_t)num_writers * keys_per_writer;
+	const uint64_t max_key_len   = 16;
+	// 256 initial cells → ~9 doublings for 20 000 keys (256→...→131 072)
+	const uint64_t initial_cells = 256;
+
+	// Generate one large unique-key buffer, then partition into per-writer slices.
+	uint64_t buf_size = total_keys * kv_required_size(max_key_len, DEFAULT_VALUE_SIZE);
+	uint8_t* kvs_buf  = malloc(buf_size);
+	if (!kvs_buf) { printf("Error: malloc failed\n"); return; }
+	gen_uniq_kvs(kvs_buf, total_keys, max_key_len);
+
+	// Scan the tightly-packed buffer to find the byte start of each writer's slice.
+	uint8_t* writer_starts[MT_ILG_WRITERS];
+	{
+		uint8_t* ptr = kvs_buf;
+		int next = 0;
+		for (uint64_t i = 0; i < total_keys; i++) {
+			if (i % keys_per_writer == 0)
+				writer_starts[next++] = ptr;
+			ptr += kv_size((ct_kv*)ptr);
+		}
+	}
+
+	cuckoo_trie* trie = ct_alloc(initial_cells);
+	mt_ilg_writer_slot slots[MT_ILG_WRITERS];
+	for (int w = 0; w < num_writers; w++) {
+		slots[w].trie           = trie;
+		slots[w].kvs            = writer_starts[w];
+		slots[w].num_kvs        = keys_per_writer;
+		slots[w].inserted_count = 0;
+		slots[w].writer_done    = 0;
+	}
+
+	mt_ilg_reader_arg rarg = { slots, num_writers };
+
+	pthread_t writers[MT_ILG_WRITERS];
+	pthread_t readers[MT_ILG_READERS];
+	for (int r = 0; r < num_readers; r++) {
+		if (pthread_create(&readers[r], NULL, mt_ilg_reader_thread, &rarg) != 0) {
+			printf("Error creating reader %d\n", r);
+			return;
+		}
+	}
+	for (int w = 0; w < num_writers; w++) {
+		if (pthread_create(&writers[w], NULL, mt_ilg_writer_thread, &slots[w]) != 0) {
+			printf("Error creating writer %d\n", w);
+			return;
+		}
+	}
+	for (int w = 0; w < num_writers; w++)
+		pthread_join(writers[w], NULL);
+	for (int r = 0; r < num_readers; r++)
+		pthread_join(readers[r], NULL);
+
+	ct_free(trie);
+	free(kvs_buf);
+	printf("OK!\n");
 }
 
 typedef struct {
@@ -805,6 +967,8 @@ int main(int argc, char** argv) {
 		test_iter();
 	else if (!strcmp(test_name, "mt-insert-lookup"))
 		test_mt_insert_lookup();
+	else if (!strcmp(test_name, "mt-insert-lookup-grow"))
+		test_mt_insert_lookup_grow();
 	else if (!strcmp(test_name, "mt-insert-scan"))
 		test_mt_insert_scan(verbose);
 	else if (!strcmp(test_name, "mt-insert-succ"))

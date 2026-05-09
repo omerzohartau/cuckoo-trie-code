@@ -91,6 +91,11 @@ fi
 echo "Build done." | tee -a "$LOG"
 echo "" | tee -a "$LOG"
 
+# Reset result files so re-runs don't accumulate stale data.
+: > "$RESULTS_DIR/throughput_vs_threads.txt"
+: > "$RESULTS_DIR/lookup_during_resize.txt"
+: > "$RESULTS_DIR/timeseries.txt"
+
 # --------------------------------------------------------------------------
 # Helper: run one benchmark with a hard timeout.
 #

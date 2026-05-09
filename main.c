@@ -5,7 +5,6 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <immintrin.h>
-#include <execinfo.h>
 
 #include "cuckoo_trie.h"
 #include "random.h"
@@ -379,9 +378,6 @@ static ct_entry_storage* find_entry_in_pair_by_color_impl(cuckoo_trie* trie, ct_
 		if (count >= 100) {
 			if (fatal) {
 				fprintf(stderr, "cuckoo_trie: find_entry_in_pair_by_color: entry not found after 100 retries (cuckoo invariant broken)\n");
-				void* bt[32];
-				int n = backtrace(bt, 32);
-				backtrace_symbols_fd(bt, n, 2);
 				abort();
 			}
 			return NULL;
@@ -729,7 +725,10 @@ int get_predecessor_atomic(cuckoo_trie* trie, ct_pred_locator* pred_locator, ct_
 		return 1;
 	}
 
-	locator_to_entry(trie, &(subtree_root.value.max_leaf), result);
+	// Use the try-variant: a concurrent grow may have swapped trie->buckets so the
+	// locator's primary_bucket index is stale.  Return 0 (retry) on miss.
+	if (!locator_to_entry_try(trie, &(subtree_root.value.max_leaf), result))
+		return 0;
 	if (entry_type(&(result->value)) != TYPE_LEAF) {
 		// Failure - more keys were added under the subtree max leaf since we read it
 		return 0;

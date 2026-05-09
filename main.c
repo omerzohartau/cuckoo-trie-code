@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <immintrin.h>
+#include <execinfo.h>
 
 #include "cuckoo_trie.h"
 #include "random.h"
@@ -378,6 +379,9 @@ static ct_entry_storage* find_entry_in_pair_by_color_impl(cuckoo_trie* trie, ct_
 		if (count >= 100) {
 			if (fatal) {
 				fprintf(stderr, "cuckoo_trie: find_entry_in_pair_by_color: entry not found after 100 retries (cuckoo invariant broken)\n");
+				void* bt[32];
+				int n = backtrace(bt, 32);
+				backtrace_symbols_fd(bt, n, 2);
 				abort();
 			}
 			return NULL;

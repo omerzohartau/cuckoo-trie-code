@@ -2491,7 +2491,15 @@ static void help_migrate_batch(cuckoo_trie* old_trie, cuckoo_trie* new_trie)
 			return;  // end-of-list sentinel reached
 
 		ct_entry_locator loc = cursor_unpack(cursor);
-		locator_to_entry(old_trie, &loc, &cur);
+
+		// Use the bounded try-variant: a helper thread may have read this cursor
+		// position BEFORE another thread advanced the cursor to the sentinel and
+		// the resizer completed the swap (replacing old_trie->buckets).  In that
+		// window the old locator is valid for the pre-swap bucket array but not
+		// the post-swap one, so the search fails.  All entries are already in
+		// new_trie by the time the swap occurs, so returning is correct.
+		if (!locator_to_entry_try(old_trie, &loc, &cur))
+			return;
 
 		assert(entry_type(&cur.value) == TYPE_LEAF);
 		if (entry_type(&cur.value) != TYPE_LEAF) {

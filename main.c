@@ -2503,13 +2503,6 @@ int ct_grow(cuckoo_trie* trie)
 		return 0;
 	}
 
-	// Free the new_trie struct from a prior grow — by now all helpers that held a
-	// local pointer to it have long since finished (a full grow cycle has elapsed).
-	if (trie->old_new_trie) {
-		free(trie->old_new_trie);
-		trie->old_new_trie = NULL;
-	}
-
 	// Initialise migration cursor to the first leaf entry.
 	ct_entry_local_copy head;
 	read_min_leaf(trie, &head);
@@ -2567,10 +2560,13 @@ int ct_grow(cuckoo_trie* trie)
 	trie->old_buckets     = old_buckets;
 	trie->old_num_buckets = old_num_buckets;
 
-	if (trie->old_new_trie)
-		free(trie->old_new_trie);
-	new_trie->buckets  = NULL;   // already swapped into trie; don't munmap again
-	trie->old_new_trie = new_trie;
+	new_trie->buckets    = NULL;   // already swapped into trie; don't munmap again
+	// Chain onto the deferred-free list instead of freeing immediately.
+	// A non-resizer thread may have loaded new_trie_ptr before the swap and
+	// still hold a local pointer to this struct; freeing here would be a UAF.
+	// The chain is freed in ct_free when all threads are done.
+	new_trie->old_new_trie = trie->old_new_trie;
+	trie->old_new_trie     = new_trie;
 
 	if (mtdbg_was_on)
 		ct_mtdbg_set_enabled(1);
@@ -2648,9 +2644,15 @@ void ct_free(cuckoo_trie* trie) {
 		uint64_t old_pages = (trie->old_num_buckets * sizeof(ct_bucket)) / HUGEPAGE_SIZE + 1;
 		munmap(trie->old_buckets, old_pages * HUGEPAGE_SIZE);
 	}
-	// Free the new_trie struct from the last grow (buckets already swapped into trie).
-	if (trie->old_new_trie)
-		free(trie->old_new_trie);
+	// Free all chained new_trie structs from previous grows.
+	{
+		cuckoo_trie* p = trie->old_new_trie;
+		while (p) {
+			cuckoo_trie* next = p->old_new_trie;
+			free(p);
+			p = next;
+		}
+	}
 #endif
 	free(trie);
 }

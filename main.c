@@ -5,29 +5,11 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <immintrin.h>
-#include <signal.h>
-#include <execinfo.h>
 
 #include "cuckoo_trie.h"
 #include "random.h"
 #include "main.h"
 #include "util.h"
-
-static void sigabrt_handler(int sig) {
-	(void)sig;
-	void* bt[64];
-	int n = backtrace(bt, 64);
-	backtrace_symbols_fd(bt, n, 2);
-	signal(SIGABRT, SIG_DFL);
-	raise(SIGABRT);
-}
-__attribute__((constructor)) static void install_sigabrt_handler(void) {
-	struct sigaction sa;
-	sa.sa_handler = sigabrt_handler;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESETHAND;
-	sigaction(SIGABRT, &sa, NULL);
-}
 
 // The root has to have a last symbol in order to have an alternate bucket.
 // The following value was arbitrarily chosen.
@@ -1582,10 +1564,23 @@ int split_jump_node(ct_finger* finger) {
 	if (!has_tail) {
 		// If no tail remains we'll have to change the parent_color of the current
 		// child of the jump node. Find and lock it.
+		// Use the bounded try-variant: a concurrent split_leaf may have overwritten
+		// the child entry (which can be a leaf) with a new internal node that has a
+		// different color, making the color-based search fail permanently.  A miss
+		// means the trie structure changed → the containing_entry seqlock also changed
+		// → upgrade_lock(containing_entry) below would have returned SI_RETRY anyway.
+#ifdef MULTITHREADING
+		if (!find_entry_in_pair_by_color_try(finger->trie, &bitmap_child,
+											 hash_to_bucket(tail_prefix_hash),
+											 hash_to_tag(tail_prefix_hash),
+											 entry_child_color(&jump_node_backup)))
+			goto locking_failed;
+#else
 		find_entry_in_pair_by_color(finger->trie, &bitmap_child,
 									hash_to_bucket(tail_prefix_hash),
 									hash_to_tag(tail_prefix_hash),
 									entry_child_color(&jump_node_backup));
+#endif
 
 		ret = upgrade_lock(&(finger->lock_mgr), &bitmap_child);
 		if (ret == SI_RETRY)

@@ -21,10 +21,7 @@ DATASET_DIR="/specific/disk1/home/datasets"
 BENCH_TIMEOUT=6000
 
 RUNS=5
-THREAD_COUNTS="1 2 4 8 12 16 24"
-# mod-resize at t=1,2 takes >100 min even with 100m timeout (O(n log n) migration
-# overhead with 1M starting cells); skip those thread counts for resize configs.
-MOD_RESIZE_THREAD_COUNTS="4 8 12 16 24"
+THREAD_COUNTS="4 8 12 16 24"
 TIMESERIES_THREADS=4
 # Small initial table: 1M cells -> multiple doublings across 200M keys
 SMALL_INITIAL_CELLS=1000000
@@ -175,10 +172,7 @@ while IFS= read -r DATASET; do
             echo "# mod-no-resize t=$t run=$run" >> "$THRU_FILE"
             run_bench "mod-no-resize t=$t run=$run" "$THRU_FILE" \
                 "$MODIFIED" mt-insert --threads "$t" "$DATASET"
-        done
-    done
-    for t in $MOD_RESIZE_THREAD_COUNTS; do
-        for run in $(seq 1 $RUNS); do
+
             echo "# mod-resize t=$t run=$run" >> "$THRU_FILE"
             run_bench "mod-resize t=$t run=$run" "$THRU_FILE" \
                 "$MODIFIED" mt-insert --threads "$t" \
@@ -196,18 +190,14 @@ while IFS= read -r DATASET; do
         | tee -a "$LOOKUP_FILE" "$LOG"
     echo "# label insert_threads lookup_threads ops ms" >> "$LOOKUP_FILE"
 
-    LOOKUP_THREAD_COUNTS="2 4 8 16"
-    MOD_LOOKUP_RESIZE_THREAD_COUNTS="4 8 16"
+    LOOKUP_THREAD_COUNTS="4 8 16"
     for t in $LOOKUP_THREAD_COUNTS; do
         for run in $(seq 1 $RUNS); do
             echo "# base-lookup t=$t run=$run" >> "$LOOKUP_FILE"
             run_bench "base-lookup t=$t run=$run" "$LOOKUP_FILE" \
                 "$BASE" mw-insert-pos-lookup \
                 --insert-threads "$t" --lookup-threads "$t" "$DATASET"
-        done
-    done
-    for t in $MOD_LOOKUP_RESIZE_THREAD_COUNTS; do
-        for run in $(seq 1 $RUNS); do
+
             echo "# mod-lookup-resize t=$t run=$run" >> "$LOOKUP_FILE"
             run_bench "mod-lookup-resize t=$t run=$run" "$LOOKUP_FILE" \
                 "$MODIFIED" mw-insert-pos-lookup \

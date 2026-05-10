@@ -20,7 +20,7 @@ DATASET_DIR="/specific/disk1/home/datasets"
 # Maximum seconds per individual benchmark invocation (100 min).
 BENCH_TIMEOUT=6000
 
-RUNS=5
+RUNS=3
 THREAD_COUNTS="4 8 12 16 24"
 TIMESERIES_THREADS=4
 # Small initial table: 1M cells -> multiple doublings across 200M keys
@@ -168,10 +168,6 @@ while IFS= read -r DATASET; do
             echo "# base  t=$t run=$run" >> "$THRU_FILE"
             run_bench "base t=$t run=$run" "$THRU_FILE" \
                 "$BASE" mt-insert --threads "$t" "$DATASET"
-
-            echo "# mod-no-resize t=$t run=$run" >> "$THRU_FILE"
-            run_bench "mod-no-resize t=$t run=$run" "$THRU_FILE" \
-                "$MODIFIED" mt-insert --threads "$t" "$DATASET"
 
             echo "# mod-resize t=$t run=$run" >> "$THRU_FILE"
             run_bench "mod-resize t=$t run=$run" "$THRU_FILE" \
